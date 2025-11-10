@@ -3,7 +3,7 @@
         <prompt>Calculate the compound interest on $10,000 invested at 5% annual interest rate, compounded monthly for 3 years. What is the final amount in dollars (rounded to 2 decimal places)?</prompt>
         <response>11614.72</response>
     </task>
-    <!-- <task>
+    <task>
         <prompt>A projectile is launched at a 45-degree angle with an initial velocity of 50 m/s. Calculate the total distance (in meters) it has traveled from the launch point after 2 seconds, assuming g=9.8 m/s². Round to 2 decimal places.</prompt>
         <response>87.25</response>
     </task>
@@ -30,5 +30,5 @@
     <task>
         <prompt>Find the larger real root of the quadratic equation 3x² - 7x + 2 = 0. Give the exact value.</prompt>
         <response>2</response>
-    </task> -->
+    </task>
 </evaluation>

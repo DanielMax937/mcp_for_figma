@@ -16,37 +16,90 @@ load_dotenv()
 # Embedded evaluator prompt
 EVALUATION_PROMPT = """You are an AI assistant with access to tools.
 
-When given a task, you MUST:
-1. Use the available tools to complete the task
-2. Provide summary of each step in your approach, wrapped in <summary> tags
-3. Provide feedback on the tools provided, wrapped in <feedback> tags
-4. Provide your final response, wrapped in <response> tags
+⚠️ CRITICAL OUTPUT FORMAT REQUIREMENT ⚠️
+You MUST wrap your entire response using these THREE XML tags in this EXACT order:
 
-Summary Requirements:
-- In your <summary> tags, you must explain:
-  - The steps you took to complete the task
-  - Which tools you used, in what order, and why
-  - The inputs you provided to each tool
-  - The outputs you received from each tool
-  - A summary for how you arrived at the response
+<summary>
+[Your FULL explanation of steps, tools used, inputs/outputs, and reasoning]
+</summary>
 
-Feedback Requirements:
-- In your <feedback> tags, provide constructive feedback on the tools:
-  - Comment on tool names: Are they clear and descriptive?
-  - Comment on input parameters: Are they well-documented? Are required vs optional parameters clear?
-  - Comment on descriptions: Do they accurately describe what the tool does?
-  - Comment on any errors encountered during tool usage: Did the tool fail to execute? Did the tool return too many tokens?
-  - Identify specific areas for improvement and explain WHY they would help
-  - Be specific and actionable in your suggestions
-  
-Response Requirements:
-- Your response should be concise and directly address what was asked
-- Always wrap your final response in <response> tags
-- If you cannot solve the task return <response>NOT_FOUND</response>
-- For numeric responses, provide just the number
-- For IDs, provide just the ID
-- For names or text, provide the exact text requested
-- Your response should go last"""
+<feedback>
+[Your feedback on the tools provided]
+</feedback>
+
+<response>
+[ONLY the raw answer - EXACT format as requested, NO extra symbols or text]
+</response>
+
+CRITICAL RULES FOR <response> TAG:
+1. Return ONLY the raw value - NO explanations, NO sentences, NO markdown formatting
+2. Do NOT add currency symbols ($, €, £) unless specifically asked
+3. If question says "in dollars" - return just the NUMBER (e.g., 11614.72, NOT $11614.72)
+4. If question says "return the amount with $" - then include $ (e.g., $11614.72)
+5. Match the EXACT precision requested (e.g., "2 decimal places" = 11614.72, NOT 11614.7 or 11614.721)
+
+✅ CORRECT EXAMPLES:
+
+Example 1 - Question: "What is the final amount in dollars?"
+<summary>
+I used the calculator tool to compute compound interest.
+The result is 11614.72 dollars.
+</summary>
+<feedback>
+The calculator tool lacks a description field.
+</feedback>
+<response>
+11614.72
+</response>
+
+Example 2 - Question: "What is the population standard deviation? Round to 2 decimal places."
+<summary>
+I calculated the standard deviation using the formula.
+The result is 7.61.
+</summary>
+<feedback>
+Tool worked well.
+</feedback>
+<response>
+7.61
+</response>
+
+Example 3 - Scientific notation requested
+<summary>
+Calculated energy using E=hc/λ formula.
+Result is 3.61e-19 joules.
+</summary>
+<feedback>
+Tool performed calculation correctly.
+</feedback>
+<response>
+3.61e-19
+</response>
+
+❌ WRONG - Adding $ when "in dollars" is mentioned:
+<response>
+$11614.72
+</response>
+
+❌ WRONG - Explanation in response:
+<response>
+The final amount is 11614.72 (rounded to 2 decimal places)
+</response>
+
+❌ WRONG - Bold/formatting:
+<response>
+**11614.72**
+</response>
+
+✅ CORRECT - Just the number:
+<response>
+11614.72
+</response>
+
+REMEMBER: 
+- "in dollars" or "in meters" means return JUST THE NUMBER
+- Put ALL context and explanations in <summary>
+- <response> = bare value only, exact format requested"""
 
 client = Anthropic(
     api_key=os.getenv("ANTHROPIC_AUTH_TOKEN"),
@@ -114,6 +167,28 @@ def agent_loop(prompt: str, tools: List[Dict[str, Any]] = None) -> Tuple[str, Di
             tools=tools,
         )
         messages.append({"role": "assistant", "content": response.content})
+    
+    # After tool execution is complete, add a reminder about XML format if needed
+    if response.stop_reason != "tool_use":
+        # Check if response contains XML tags
+        response_text = next(
+            (block.text for block in response.content if hasattr(block, "text")),
+            "",
+        )
+        if not ("<summary>" in response_text and "<feedback>" in response_text and "<response>" in response_text):
+            # Add a format reminder and get a new response
+            messages.append({
+                "role": "user",
+                "content": "IMPORTANT: You must format your response using the three required XML tags: <summary>, <feedback>, and <response>. Please reformat your answer to include all three tags with your content inside them."
+            })
+            response = client.messages.create(
+                model=model,
+                max_tokens=4096,
+                system=EVALUATION_PROMPT,
+                messages=messages,
+                tools=tools,
+            )
+            messages.append({"role": "assistant", "content": response.content})
 
     response = next(
         (block.text for block in response.content if hasattr(block, "text")),
@@ -157,20 +232,84 @@ def evaluate_single_task(
 
     # Extract all tagged content
     def _extract_xml_content(text, tag):
+        print(f"text is {text}")
+        if not text:
+            return None
         pattern = rf"<{tag}>(.*?)</{tag}>"
         matches = re.findall(pattern, text, re.DOTALL)
         return matches[-1].strip() if matches else None
+    
+    def _clean_response(text):
+        """Clean verbose response to extract just the answer."""
+        if not text:
+            return text
+        
+        # Remove markdown bold/italics first
+        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+        text = re.sub(r'\*([^*]+)\*', r'\1', text)
+        
+        # Try to extract a number (with optional currency symbol) from the text
+        # This handles: $11,614.72, 11614.72, 3.61e-19, etc.
+        number_pattern = r'[\$€£]?\s*-?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][+-]?\d+)?'
+        
+        # Pattern: "The answer is X" or "The final amount is X"
+        match = re.search(r'(?:is|are)\s+(' + number_pattern + r')', text)
+        if match:
+            text = match.group(1)
+        else:
+            # Pattern: "X (rounded to...)" -> extract X from beginning
+            match = re.search(r'^([^\(]+?)\s*\(', text)
+            if match:
+                text = match.group(1).strip()
+        
+        # If it's multiple lines, extract from first line
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        if lines and len(lines) > 1:
+            first_line = lines[0]
+            match = re.search(number_pattern, first_line)
+            if match:
+                text = match.group(0)
+        
+        # If text still has non-numeric content, try to extract just the number
+        if not re.match(r'^[\$€£]?\s*-?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][+-]?\d+)?$', text.strip()):
+            match = re.search(number_pattern, text)
+            if match:
+                text = match.group(0)
+        
+        # Remove currency symbols (we want raw numbers)
+        text = re.sub(r'^[\$€£]\s*', '', text)
+        
+        # Remove commas from numbers (11,614.72 -> 11614.72)
+        text = re.sub(r'(\d),(\d)', r'\1\2', text)
+        
+        # Strip any remaining whitespace
+        text = text.strip()
+        
+        return text
 
-    response, summary, feedback = (
-        _extract_xml_content(response, tag) for tag in ["response", "summary", "feedback"]
-    )
+    extracted_response = _extract_xml_content(response, "response")
+    summary = _extract_xml_content(response, "summary")
+    feedback = _extract_xml_content(response, "feedback")
+    
+    # Handle cases where XML tags weren't found
+    if extracted_response is None:
+        print(f"⚠️  Warning: Task {task_index + 1} - Response not properly formatted in XML tags")
+        print(f"Raw response: {response[:200]}...")
+        extracted_response = "NOT_FOUND"
+    else:
+        # Clean up verbose responses
+        cleaned = _clean_response(extracted_response)
+        if cleaned != extracted_response:
+            print(f"⚠️  Warning: Task {task_index + 1} - Response was verbose, cleaned from '{extracted_response[:50]}...' to '{cleaned}'")
+            extracted_response = cleaned
     duration_seconds = time.time() - start_time
-
+    task_result = task["response"]
+    print(f"extracted_response is {extracted_response}, while except response is {task_result}")
     return {
         "prompt": task["prompt"],
         "expected": task["response"],
-        "actual": response,
-        "score": int(response == task["response"]),
+        "actual": extracted_response,
+        "score": int(extracted_response == task["response"]),
         "total_duration": duration_seconds,
         "tool_calls": tool_metrics,
         "num_tool_calls": sum(len(metrics["durations"]) for metrics in tool_metrics.values()),
